@@ -352,7 +352,10 @@ def probe_subtitles(mkv_path: Path) -> list[dict]:
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed:\n{result.stderr}")
 
-    data = json.loads(result.stdout)
+    stdout = (result.stdout or "").strip()
+    if not stdout:
+        return []
+    data = json.loads(stdout)
     tracks: list[dict] = []
     for s in data.get("streams", []):
         tags = s.get("tags", {})
