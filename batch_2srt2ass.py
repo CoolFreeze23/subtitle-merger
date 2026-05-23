@@ -688,6 +688,7 @@ def build_ass_merged(
     eng_events: list[tuple[str, str]],
     por_events: list[tuple[str, str]],
     sign_mode: str = "shift",
+    match_font_to_top: bool = False,
 ) -> str:
     track_title = cfg_get("track_title")
     bot_code = cfg_get("bot_lang_code")
@@ -719,6 +720,10 @@ def build_ass_merged(
 
     eng_style_lines = adjust_eng_styles(eng_style_lines)
 
+    font_info = None
+    if match_font_to_top:
+        font_info = _extract_primary_dialogue_font(eng_style_lines)
+
     play_res_y = _get_play_res_y(script_info)
     max_eng_bot_mv = _get_max_bottom_dialogue_margin(eng_style_lines)
     por_bot_mv = play_res_y - max_eng_bot_mv + POR_BOT_GAP
@@ -730,6 +735,7 @@ def build_ass_merged(
         por_style_lines,
         por_bot_margin=por_bot_mv,
         por_top_margin=por_top_mv,
+        match_font=font_info,
     )
 
     if fmt_line:
@@ -856,10 +862,46 @@ def adjust_eng_styles(style_lines: list[str], margin_offset: int = 20) -> list[s
     return out
 
 
+def _extract_primary_dialogue_font(style_lines: list[str]) -> dict | None:
+    """Extract font properties from the first dialogue style found.
+
+    ASS Style format indices:
+      0=Name, 1=Fontname, 2=Fontsize, 3=PrimaryColour, 4=SecondaryColour,
+      5=OutlineColour, 6=BackColour, 7=Bold, 8=Italic, 9=Underline,
+      10=StrikeOut, 11=ScaleX, 12=ScaleY, 13=Spacing, 14=Angle,
+      15=BorderStyle, 16=Outline, 17=Shadow, 18=Alignment, ...
+
+    Returns dict with font-related fields to copy, or None.
+    """
+    for line in style_lines:
+        if not line.startswith("Style:"):
+            continue
+        parts = line.split(",")
+        if len(parts) < 23:
+            continue
+        name = parts[0].replace("Style:", "").strip()
+        if _is_dialogue_style(name):
+            return {
+                "fontname": parts[1].strip(),
+                "bold": parts[7].strip(),
+                "italic": parts[8].strip(),
+                "underline": parts[9].strip(),
+                "strikeout": parts[10].strip(),
+                "scale_x": parts[11].strip(),
+                "scale_y": parts[12].strip(),
+                "spacing": parts[13].strip(),
+                "border_style": parts[15].strip(),
+                "outline": parts[16].strip(),
+                "shadow": parts[17].strip(),
+            }
+    return None
+
+
 def adjust_por_styles(
     style_lines: list[str],
     por_bot_margin: int | None = None,
     por_top_margin: int | None = None,
+    match_font: dict | None = None,
 ) -> list[str]:
     por_primary = cfg_get("bot_primary_colour")
     por_outline = cfg_get("bot_outline_colour")
@@ -889,6 +931,19 @@ def adjust_por_styles(
             parts[3] = por_primary
             parts[5] = por_outline
             parts[6] = por_back
+
+            if match_font:
+                parts[1] = " " + match_font["fontname"]
+                parts[7] = " " + match_font["bold"]
+                parts[8] = " " + match_font["italic"]
+                parts[9] = " " + match_font["underline"]
+                parts[10] = " " + match_font["strikeout"]
+                parts[11] = " " + match_font["scale_x"]
+                parts[12] = " " + match_font["scale_y"]
+                parts[13] = " " + match_font["spacing"]
+                parts[15] = " " + match_font["border_style"]
+                parts[16] = " " + match_font["outline"]
+                parts[17] = " " + match_font["shadow"]
 
             alignment = parts[18].strip()
             if alignment in ASS_BOTTOM_ALIGNMENTS and por_bot_margin is not None:
@@ -1423,6 +1478,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         ttk.Radiobutton(
             sign_frame, text="Strip positioning (remove \\pos, let renderer auto-place)",
             variable=self.sign_mode_var, value="strip",
+        ).pack(anchor="w")
+
+        font_frame = ttk.LabelFrame(self.ass_merge_frame, text="Font Matching", padding=4)
+        font_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
+        self.match_font_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            font_frame,
+            text="Match bottom font to top (copies font, bold, outline style from top language — keeps color and size separate)",
+            variable=self.match_font_var,
         ).pack(anchor="w")
 
         self.ass_merge_frame.columnconfigure(0, weight=1)
@@ -2134,10 +2198,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
                     merge_info = eng_info if eng_info else self.script_info
                     s_mode = getattr(self, "sign_mode_var", None)
+                    m_font = getattr(self, "match_font_var", None)
                     ass_content = build_ass_merged(
                         merge_info, eng_styles, por_styles,
                         eng_events, por_events,
                         sign_mode=s_mode.get() if s_mode else "shift",
+                        match_font_to_top=m_font.get() if m_font else False,
                     )
                 else:
                     top_cues = parse_srt(top_path)
