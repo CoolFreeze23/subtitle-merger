@@ -1147,6 +1147,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._intermediate_files: list[Path] = []
         self._last_output_dir: Path | None = None
         self._converting = False
+        self._remembered_top: dict | None = None
+        self._remembered_bot: dict | None = None
 
         self._build_ui()
         self._bind_shortcuts()
@@ -1198,6 +1200,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.skip_forced_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(mkv_frame, text="Skip forced",
                          variable=self.skip_forced_var).pack(side="left", padx=(6, 0))
+        ttk.Button(mkv_frame, text="Reset track memory", command=self._reset_track_memory).pack(side="left", padx=(6, 0))
         if HAS_DND:
             self.mkv_label.drop_target_register(DND_FILES)
             self.mkv_label.dnd_bind("<<Drop>>", self._on_drop_mkv)
@@ -1503,6 +1506,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             cfg_save()
             self._process_mkvs([Path(f) for f in files])
 
+    def _reset_track_memory(self):
+        self._remembered_top = None
+        self._remembered_bot = None
+        self.status_var.set("Track memory cleared — next MKV will prompt for selection.")
+
     def _on_drop_mkv(self, event):
         try:
             paths = _parse_dnd_paths(event.data)
@@ -1542,10 +1550,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
             top_lang = cfg_get("top_lang_name")
             bot_lang = cfg_get("bot_lang_name")
-            eng_pick = self._resolve_track(mkv.name, f"{top_lang} (Top)", eng_tracks, tracks)
+            eng_pick = self._resolve_track(mkv.name, f"{top_lang} (Top)", eng_tracks, tracks, is_top=True)
             if eng_pick is None:
                 continue
-            por_pick = self._resolve_track(mkv.name, f"{bot_lang} (Bot)", por_tracks, tracks)
+            por_pick = self._resolve_track(mkv.name, f"{bot_lang} (Bot)", por_tracks, tracks, is_top=False)
             if por_pick is None:
                 continue
 
@@ -1617,20 +1625,58 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self.status_var.set(f"Extracted subtitles from {extracted} file(s). Click Auto-Match to pair.")
 
     def _resolve_track(self, mkv_name: str, label: str,
-                       candidates: list[dict], all_tracks: list[dict]) -> dict | None:
+                       candidates: list[dict], all_tracks: list[dict],
+                       is_top: bool = True) -> dict | None:
+        remembered = self._remembered_top if is_top else self._remembered_bot
+
+        if remembered and candidates:
+            by_index = next((t for t in candidates if t["index"] == remembered["index"]), None)
+            if by_index:
+                self.status_var.set(
+                    f"Auto-selected #{by_index['index']} "
+                    f"({by_index['language']} - {by_index.get('title','')}) for {mkv_name}")
+                self.update_idletasks()
+                return by_index
+            by_title = next(
+                (t for t in candidates
+                 if t.get("title", "").strip().lower() == remembered.get("title", "").strip().lower()
+                 and t["language"] == remembered["language"]),
+                None,
+            )
+            if by_title:
+                self.status_var.set(
+                    f"Auto-selected #{by_title['index']} "
+                    f"({by_title['language']} - {by_title.get('title','')}) for {mkv_name}")
+                self.update_idletasks()
+                return by_title
+
         if len(candidates) == 1:
-            return candidates[0]
+            pick = candidates[0]
+            if is_top:
+                self._remembered_top = pick
+            else:
+                self._remembered_bot = pick
+            return pick
+
         if len(candidates) == 0:
-            return self._pick_track_dialog(
+            pick = self._pick_track_dialog(
                 mkv_name, label,
                 f"No {label.split('(')[0].strip()} tracks auto-detected.\nChoose manually:",
                 all_tracks,
             )
-        return self._pick_track_dialog(
-            mkv_name, label,
-            f"Multiple {label.split('(')[0].strip()} tracks found.\nChoose one:",
-            candidates,
-        )
+        else:
+            pick = self._pick_track_dialog(
+                mkv_name, label,
+                f"Multiple {label.split('(')[0].strip()} tracks found.\nChoose one:",
+                candidates,
+            )
+
+        if pick is not None:
+            if is_top:
+                self._remembered_top = pick
+            else:
+                self._remembered_bot = pick
+        return pick
 
     def _pick_track_dialog(self, mkv_name: str, label: str,
                            message: str, tracks: list[dict]) -> dict | None:
