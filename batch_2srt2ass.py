@@ -7,8 +7,9 @@ import sys
 import json
 import subprocess
 import shutil
+import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 from pathlib import Path
 from difflib import SequenceMatcher
 
@@ -18,19 +19,121 @@ try:
 except ImportError:
     HAS_DND = False
 
+try:
+    import sv_ttk
+    HAS_THEME = True
+except ImportError:
+    HAS_THEME = False
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "batch_2srt2ass_config.json"
+
+# ---------------------------------------------------------------------------
+# Configuration system
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG: dict = {
+    "top_lang_name": "English",
+    "top_lang_code": "en",
+    "top_lang_tags": "en,eng,english",
+    "bot_lang_name": "Portuguese",
+    "bot_lang_code": "pt",
+    "bot_lang_tags": "pt,por,portuguese",
+    "bot_primary_colour": "&H0000FFFF",
+    "bot_outline_colour": "&H00000000",
+    "bot_back_colour": "&H80000000",
+    "bot_fontsize_reduction": 4,
+    "output_pattern": "{basename}.{lang}.ass",
+    "track_title": "For Julia <3",
+    "last_top_dir": "",
+    "last_bot_dir": "",
+    "last_mkv_dir": "",
+    "last_tpl_path": "",
+    "window_geometry": "",
+    "templates": {},
+}
+
+_cfg: dict = {}
+
+
+def load_config() -> dict:
+    raw: dict = {}
+    if CONFIG_PATH.is_file():
+        try:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    for k, v in DEFAULT_CONFIG.items():
+        if k not in raw:
+            raw[k] = v
+    return raw
+
+
+def save_config(data: dict):
+    CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def init_config():
+    global _cfg
+    _cfg = load_config()
+
+
+def cfg_get(key: str):
+    return _cfg.get(key, DEFAULT_CONFIG.get(key))
+
+
+def cfg_set(key: str, value):
+    _cfg[key] = value
+
+
+def cfg_save():
+    save_config(_cfg)
+
+
+def load_templates() -> dict[str, str]:
+    return _cfg.get("templates", {})
+
+
+def save_templates(templates: dict[str, str]):
+    _cfg["templates"] = templates
+    cfg_save()
+
+
+def get_top_tags() -> set[str]:
+    return {t.strip().lower() for t in cfg_get("top_lang_tags").split(",") if t.strip()}
+
+
+def get_bot_tags() -> set[str]:
+    return {t.strip().lower() for t in cfg_get("bot_lang_tags").split(",") if t.strip()}
+
+
+# ---------------------------------------------------------------------------
+# Color conversion helpers (ASS &HBBGGRR <-> #RRGGBB)
+# ---------------------------------------------------------------------------
+
+def ass_color_to_rgb(ass_color: str) -> str:
+    h = ass_color.replace("&H", "").replace("&h", "").lstrip("0") or "0"
+    h = h.zfill(6)
+    if len(h) == 8:
+        h = h[2:]
+    elif len(h) > 6:
+        h = h[-6:]
+    h = h.zfill(6)
+    bb, gg, rr = h[0:2], h[2:4], h[4:6]
+    return f"#{rr}{gg}{bb}"
+
+
+def rgb_to_ass_color(rgb_hex: str, alpha: str = "00") -> str:
+    rgb_hex = rgb_hex.lstrip("#").zfill(6)
+    rr, gg, bb = rgb_hex[0:2], rgb_hex[2:4], rgb_hex[4:6]
+    return f"&H{alpha}{bb}{gg}{rr}".upper()
+
 
 # ---------------------------------------------------------------------------
 # ASS template parsing
 # ---------------------------------------------------------------------------
 
 def parse_ass_template(path: Path) -> tuple[list[str], list[str]]:
-    """Extract [Script Info] and [V4+ Styles] sections from a .ass file.
-
-    Returns (script_info_lines, styles_lines) with section headers included.
-    Skips [Aegisub Project Garbage].
-    """
     text = path.read_text(encoding="utf-8-sig")
     lines = text.splitlines()
 
@@ -73,14 +176,12 @@ HTML_TAG = re.compile(r"<[^>]+>")
 
 
 def srt_ts_to_ass(hms: str, ms: str) -> str:
-    """Convert SRT timestamp parts to ASS format (H:MM:SS.cc)."""
     h, m, s = hms.split(":")
     centiseconds = int(ms[:2]) if len(ms) >= 2 else int(ms) * 10
     return f"{int(h)}:{m}:{s}.{centiseconds:02d}"
 
 
 def parse_srt(path: Path) -> list[dict]:
-    """Parse an SRT file and return a list of cue dicts."""
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             text = path.read_text(encoding=enc)
@@ -106,23 +207,22 @@ def parse_srt(path: Path) -> list[dict]:
 # ASS generation
 # ---------------------------------------------------------------------------
 
-TRACK_TITLE = "For Julia <3"
-
 def build_ass(
     script_info: list[str],
     styles: list[str],
     top_cues: list[dict],
     bot_cues: list[dict],
 ) -> str:
-    """Build a complete ASS file string from template sections and cues."""
+    track_title = cfg_get("track_title")
+    bot_code = cfg_get("bot_lang_code")
     lines: list[str] = []
 
     for l in script_info:
         if l.startswith("Title:"):
             continue
         lines.append(l)
-    lines.insert(1, f"Title: {TRACK_TITLE}")
-    lines.insert(2, "Language: pt")
+    lines.insert(1, f"Title: {track_title}")
+    lines.insert(2, f"Language: {bot_code}")
     lines.append("")
 
     for l in styles:
@@ -169,7 +269,6 @@ LANG_SUFFIXES = re.compile(
 
 
 def base_name(filename: str) -> str:
-    """Strip language suffix and extension to get a comparable base name."""
     stem = Path(filename).stem
     stem = LANG_SUFFIXES.sub("", stem)
     stem = LANG_SUFFIXES.sub("", stem)
@@ -179,11 +278,6 @@ def base_name(filename: str) -> str:
 def match_files(
     top_files: list[str], bot_files: list[str]
 ) -> tuple[list[tuple[str, str, float]], list[str], list[str]]:
-    """Auto-match Top and Bot SRT files by filename similarity.
-
-    Returns (pairs, unmatched_top, unmatched_bot) where each pair is
-    (top_filename, bot_filename, confidence).
-    """
     top_bases = {f: base_name(f) for f in top_files}
     bot_bases = {f: base_name(f) for f in bot_files}
 
@@ -213,19 +307,20 @@ def match_files(
     pairs.sort(key=lambda p: p[0].lower())
     return pairs, unmatched_top, unmatched_bot
 
+
 def output_name(top_srt: str) -> str:
-    """Derive output .ass filename: {basename}.pt.ass"""
     stem = Path(top_srt).stem
     cleaned = LANG_SUFFIXES.sub("", stem)
     cleaned = LANG_SUFFIXES.sub("", cleaned)
-    return f"{cleaned}.pt.ass"
+    pattern = cfg_get("output_pattern")
+    lang = cfg_get("bot_lang_code")
+    return pattern.replace("{basename}", cleaned).replace("{lang}", lang)
 
 # ---------------------------------------------------------------------------
 # FFmpeg helpers
 # ---------------------------------------------------------------------------
 
 def find_ffmpeg() -> tuple[str, str]:
-    """Return (ffmpeg_path, ffprobe_path) or raise if not found."""
     for name in ("ffmpeg", "ffprobe"):
         if shutil.which(name):
             continue
@@ -245,10 +340,6 @@ FORCED_TITLE_RE = re.compile(r"\bforced\b", re.IGNORECASE)
 
 
 def probe_subtitles(mkv_path: Path) -> list[dict]:
-    """Return a list of subtitle stream dicts from an MKV file.
-
-    Each dict has keys: index (int), codec, language, title, forced (bool).
-    """
     _, ffprobe = find_ffmpeg()
     cmd = [
         ffprobe, "-v", "quiet",
@@ -280,11 +371,6 @@ def probe_subtitles(mkv_path: Path) -> list[dict]:
 
 def extract_subtitle(mkv_path: Path, stream_index: int, out_path: Path,
                      codec: str = "srt") -> Path:
-    """Extract a single subtitle stream from an MKV.
-
-    If the source codec is ASS/SSA, extracts as-is (copy). Otherwise
-    converts to SRT.
-    """
     ffmpeg, _ = find_ffmpeg()
     is_ass = codec.lower() in ("ass", "ssa")
     if is_ass:
@@ -303,20 +389,13 @@ def extract_subtitle(mkv_path: Path, stream_index: int, out_path: Path,
     return out_path
 
 
-ENG_TAGS = {"en", "eng", "english"}
-POR_TAGS = {"pt", "por", "portuguese"}
-
-
 def auto_pick_tracks(tracks: list[dict], skip_forced: bool = True) -> tuple[list[dict], list[dict]]:
-    """Partition tracks into (english_candidates, portuguese_candidates).
-
-    When skip_forced is True, tracks flagged as forced are excluded since
-    they typically only contain sign/song translations.
-    """
     pool = [t for t in tracks if not (skip_forced and t.get("forced"))]
-    eng = [t for t in pool if t["language"].lower() in ENG_TAGS]
-    por = [t for t in pool if t["language"].lower() in POR_TAGS]
-    return eng, por
+    top_tags = get_top_tags()
+    bot_tags = get_bot_tags()
+    top = [t for t in pool if t["language"].lower() in top_tags]
+    bot = [t for t in pool if t["language"].lower() in bot_tags]
+    return top, bot
 
 # ---------------------------------------------------------------------------
 # ASS-to-ASS merge helpers
@@ -326,13 +405,11 @@ POS_TAG_RE = re.compile(r"\\(?:pos|move)\([^)]*\)")
 LAYER_RE = re.compile(r"^(Dialogue|Comment):\s*(\d+)(,.*)$")
 ENG_LAYER_OFFSET = 10
 
-
 POS_XY_RE = re.compile(r"\\pos\(([^,]+),([^)]+)\)")
 MOVE_XY_RE = re.compile(r"\\move\(([^,]+),([^,]+),([^,]+),([^,)]+)")
 
 
 def _offset_pos_y(raw_line: str, y_offset: int) -> str:
-    """Shift Y in \\pos(x,y) and \\move(x1,y1,x2,y2,...) by *y_offset* pixels."""
     def shift_pos(m):
         x, y = m.group(1), m.group(2)
         try:
@@ -358,7 +435,6 @@ FS_OVERRIDE_RE = re.compile(r"\\fs(\d+(?:\.\d+)?)")
 
 
 def _ass_time_to_cs(ts: str) -> int:
-    """Convert ASS timestamp H:MM:SS.cc to centiseconds."""
     parts = ts.split(":")
     h, m = int(parts[0]), int(parts[1])
     s_parts = parts[2].split(".")
@@ -367,7 +443,6 @@ def _ass_time_to_cs(ts: str) -> int:
 
 
 def _parse_event_times(raw_line: str) -> tuple[str, str] | None:
-    """Extract (start, end) timestamps from a Dialogue/Comment line."""
     parts = raw_line.split(",", 3)
     if len(parts) >= 3:
         return parts[1].strip(), parts[2].strip()
@@ -375,7 +450,6 @@ def _parse_event_times(raw_line: str) -> tuple[str, str] | None:
 
 
 def _get_event_pos_y(raw_line: str) -> int | None:
-    """Extract Y from \\pos(x,y) in an event line."""
     m = POS_XY_RE.search(raw_line)
     if m:
         try:
@@ -386,7 +460,6 @@ def _get_event_pos_y(raw_line: str) -> int | None:
 
 
 def _get_event_font_size(raw_line: str, style_font_map: dict[str, int]) -> int:
-    """Get effective font size: \\fs override wins, otherwise style default."""
     m = FS_OVERRIDE_RE.search(raw_line)
     if m:
         try:
@@ -401,7 +474,6 @@ def _get_event_font_size(raw_line: str, style_font_map: dict[str, int]) -> int:
 
 
 def _build_style_font_map(style_lines: list[str]) -> dict[str, int]:
-    """Build a map of style_name -> font_size from style lines."""
     font_map: dict[str, int] = {}
     for line in style_lines:
         if not line.startswith("Style:"):
@@ -416,17 +488,15 @@ def _build_style_font_map(style_lines: list[str]) -> dict[str, int]:
     return font_map
 
 
+POR_BOT_GAP = 2
+SIGN_PROXIMITY_PX = 60
+
+
 def _compute_sign_offsets(
     eng_events: list[tuple[str, str]],
     por_events: list[tuple[str, str]],
     style_font_map: dict[str, int],
 ) -> dict[int, int]:
-    """For each Portuguese sign event, compute how many pixels to shift Y.
-
-    Returns a dict mapping por_event_index -> y_offset.  Only events
-    whose \\pos() is vertically close to an overlapping English sign
-    get an entry (others need no adjustment).
-    """
     eng_signs: list[tuple[int, int, int, int]] = []
     for _ts, raw in eng_events:
         parts = raw.split(",", 4)
@@ -479,12 +549,6 @@ def _compute_sign_offsets(
 
 
 def _bump_event_layer(raw_line: str, offset: int) -> str:
-    """Add *offset* to the Layer field of a Dialogue/Comment event line.
-
-    Different layers prevent the renderer from applying collision logic
-    between English and Portuguese events, so each stays at its exact
-    MarginV position.
-    """
     m = LAYER_RE.match(raw_line)
     if m:
         old_layer = int(m.group(2))
@@ -493,11 +557,6 @@ def _bump_event_layer(raw_line: str, offset: int) -> str:
 
 
 def rename_ass_styles(text: str, suffix: str = "_BR") -> str:
-    """Append *suffix* to every style name in an ASS file's text.
-
-    Updates both Style definition lines and style references in
-    Dialogue/Comment event lines.
-    """
     lines = text.splitlines()
     style_names: list[str] = []
     out: list[str] = []
@@ -532,11 +591,7 @@ def rename_ass_styles(text: str, suffix: str = "_BR") -> str:
 
 
 def strip_position_tags(text: str) -> str:
-    r"""Remove \pos(...) and \move(...) from dialogue events only.
-
-    Sign/title events keep their position tags because they are
-    designed to match specific on-screen text placements.
-    """
+    r"""Remove \pos(...) and \move(...) from dialogue events only."""
     lines = text.splitlines()
     out: list[str] = []
     for line in lines:
@@ -552,7 +607,6 @@ def strip_position_tags(text: str) -> str:
 
 
 def _read_ass_text(path: Path) -> str:
-    """Read an ASS file with encoding fallback."""
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             return path.read_text(encoding=enc)
@@ -562,12 +616,6 @@ def _read_ass_text(path: Path) -> str:
 
 
 def parse_ass_sections(path: Path) -> tuple[list[str], list[str], list[tuple[str, str]]]:
-    """Parse an ASS file into (script_info, style_lines, events).
-
-    script_info: lines from [Script Info] (including section header)
-    style_lines: lines from [V4+ Styles] (including section header + Format line)
-    events: list of (start_time, raw_line) for Dialogue/Comment lines
-    """
     text = _read_ass_text(path)
     lines = text.splitlines()
 
@@ -607,12 +655,27 @@ def parse_ass_sections(path: Path) -> tuple[list[str], list[str], list[tuple[str
 
 
 def parse_ass_events(path: Path) -> list[tuple[str, str]]:
-    """Read an ASS file and return (start_time, raw_line) for every event."""
     _, _, events = parse_ass_sections(path)
     return events
 
 
 SIGN_MODES = ("shift", "strip")
+
+
+def _get_style_names(style_lines: list[str]) -> set[str]:
+    names: set[str] = set()
+    for line in style_lines:
+        if line.startswith("Style:"):
+            name = line.split(",", 1)[0].replace("Style:", "").strip()
+            names.add(name)
+    return names
+
+
+def _check_duplicate_styles(eng_styles: list[str], por_styles: list[str]) -> list[str]:
+    """Return list of style names that appear in both sets."""
+    eng_names = _get_style_names(eng_styles)
+    por_names = _get_style_names(por_styles)
+    return sorted(eng_names & por_names)
 
 
 def build_ass_merged(
@@ -623,23 +686,16 @@ def build_ass_merged(
     por_events: list[tuple[str, str]],
     sign_mode: str = "shift",
 ) -> str:
-    """Build a merged ASS file combining styles and events from both sources.
-
-    Uses eng script_info as base.  Combines English styles + Portuguese
-    (already _BR-renamed) styles.  Events are interleaved by start time.
-
-    sign_mode controls how Portuguese sign/title events are handled:
-      "shift" — dynamically shift \\pos() Y below the nearest English sign
-      "strip" — remove \\pos()/\\move() so signs use default alignment
-    """
+    track_title = cfg_get("track_title")
+    bot_code = cfg_get("bot_lang_code")
     lines: list[str] = []
 
     for l in script_info:
         if l.startswith("Title:") or l.startswith("Collisions:"):
             continue
         lines.append(l)
-    lines.insert(1, f"Title: {TRACK_TITLE}")
-    lines.insert(2, "Language: pt")
+    lines.insert(1, f"Title: {track_title}")
+    lines.insert(2, f"Language: {bot_code}")
     lines.append("")
 
     lines.append("[V4+ Styles]")
@@ -720,14 +776,6 @@ ASS_BOTTOM_ALIGNMENTS = {"1", "2", "3"}
 ASS_TOP_ALIGNMENTS = {"7", "8", "9"}
 BOTTOM_TO_TOP_ALIGN = {"1": "7", "2": "8", "3": "9"}
 
-# Portuguese subtitle appearance — yellow text, black outline
-POR_PRIMARY_COLOUR = "&H0000FFFF"   # yellow (ASS is &HBBGGRR)
-POR_OUTLINE_COLOUR = "&H00000000"   # black outline
-POR_BACK_COLOUR = "&H80000000"      # semi-transparent shadow
-POR_FONTSIZE_REDUCTION = 4          # px smaller than English
-POR_BOT_GAP = 2                     # px gap between English bottom and Portuguese top
-SIGN_PROXIMITY_PX = 60              # vertical proximity threshold for sign overlap detection
-
 SIGN_STYLE_RE = re.compile(
     r"(?:sign|title|eyecatch|lyric|cred|show_|ep_|next_)",
     re.IGNORECASE,
@@ -735,13 +783,11 @@ SIGN_STYLE_RE = re.compile(
 
 
 def _is_dialogue_style(name: str) -> bool:
-    """True if this style is spoken dialogue rather than on-screen sign/title."""
     clean = name.replace("_BR", "").strip()
     return SIGN_STYLE_RE.search(clean) is None
 
 
 def _get_play_res_y(script_info: list[str]) -> int:
-    """Extract PlayResY from script info lines (default 360)."""
     for line in script_info:
         if line.startswith("PlayResY:"):
             try:
@@ -752,7 +798,6 @@ def _get_play_res_y(script_info: list[str]) -> int:
 
 
 def _get_max_bottom_dialogue_margin(style_lines: list[str]) -> int:
-    """Find the largest MarginV among bottom-aligned dialogue styles."""
     max_mv = 0
     for line in style_lines:
         if not line.startswith("Style:"):
@@ -770,10 +815,6 @@ def _get_max_bottom_dialogue_margin(style_lines: list[str]) -> int:
 
 
 def _get_max_top_dialogue_bottom(style_lines: list[str]) -> int:
-    """Find the lowest bottom edge among top-aligned dialogue styles.
-
-    For alignment 8 (top), the bottom edge is MarginV + FontSize.
-    """
     max_bottom = 0
     for line in style_lines:
         if not line.startswith("Style:"):
@@ -793,10 +834,6 @@ def _get_max_top_dialogue_bottom(style_lines: list[str]) -> int:
 
 
 def adjust_eng_styles(style_lines: list[str], margin_offset: int = 20) -> list[str]:
-    """Push English bottom-aligned *dialogue* styles up so they sit above Portuguese.
-
-    Sign/title styles are left untouched.
-    """
     out: list[str] = []
     for line in style_lines:
         if not line.startswith("Style:"):
@@ -821,19 +858,11 @@ def adjust_por_styles(
     por_bot_margin: int | None = None,
     por_top_margin: int | None = None,
 ) -> list[str]:
-    """Make Portuguese *dialogue* styles visually distinct: smaller, yellow.
+    por_primary = cfg_get("bot_primary_colour")
+    por_outline = cfg_get("bot_outline_colour")
+    por_back = cfg_get("bot_back_colour")
+    por_fs_reduction = int(cfg_get("bot_fontsize_reduction"))
 
-    Sign/title styles keep their original appearance since they're designed
-    to match on-screen text.
-
-    Bottom-aligned dialogue styles are flipped to top-alignment so their
-    text grows *downward* from a fixed Y position (por_bot_margin) just
-    below the English text.  This eliminates overlap regardless of line
-    count.
-
-    Top-aligned dialogue uses por_top_margin so it starts right below
-    the English top text's bottom edge.
-    """
     out: list[str] = []
     for line in style_lines:
         if not line.startswith("Style:"):
@@ -850,13 +879,13 @@ def adjust_por_styles(
         if is_dialogue:
             try:
                 fs = float(parts[2].strip())
-                parts[2] = str(max(10, int(fs - POR_FONTSIZE_REDUCTION)))
+                parts[2] = str(max(10, int(fs - por_fs_reduction)))
             except ValueError:
                 pass
 
-            parts[3] = POR_PRIMARY_COLOUR
-            parts[5] = POR_OUTLINE_COLOUR
-            parts[6] = POR_BACK_COLOUR
+            parts[3] = por_primary
+            parts[5] = por_outline
+            parts[6] = por_back
 
             alignment = parts[18].strip()
             if alignment in ASS_BOTTOM_ALIGNMENTS and por_bot_margin is not None:
@@ -870,13 +899,6 @@ def adjust_por_styles(
 
 
 def prepare_ass_for_merge(path: Path, is_portuguese: bool = False) -> Path:
-    """Prepare an ASS file for merging.
-
-    For Portuguese files: renames styles with _BR suffix.
-    For all files: strips position tags to prevent overlap.
-    Writes the modified file next to the original with a .prepared.ass suffix.
-    Returns the path to the prepared file.
-    """
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             text = path.read_text(encoding=enc)
@@ -896,41 +918,181 @@ def prepare_ass_for_merge(path: Path, is_portuguese: bool = False) -> Path:
     return out_path
 
 # ---------------------------------------------------------------------------
-# Saved templates config
+# Settings dialog
 # ---------------------------------------------------------------------------
 
-def load_config() -> dict:
-    if CONFIG_PATH.is_file():
+COLOR_PRESETS = {
+    "Yellow": "&H0000FFFF",
+    "White": "&H00FFFFFF",
+    "Cyan": "&H00FFFF00",
+    "Green": "&H0000FF00",
+    "Orange": "&H0000A5FF",
+    "Pink": "&H00CB69FF",
+    "Red": "&H000000FF",
+    "Light Blue": "&H00FF9B00",
+}
+
+
+class SettingsDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Settings")
+        self.resizable(False, False)
+        self.grab_set()
+        self.result = False
+
+        pad = dict(padx=8, pady=3)
+        row = 0
+
+        # --- Language Pair ---
+        lang_frame = ttk.LabelFrame(self, text="Language Pair", padding=8)
+        lang_frame.grid(row=row, column=0, sticky="ew", **pad)
+        row += 1
+
+        ttk.Label(lang_frame, text="Top Language").grid(row=0, column=0, columnspan=4, sticky="w")
+
+        ttk.Label(lang_frame, text="Name:").grid(row=1, column=0, sticky="w", padx=(0, 4))
+        self.top_name_var = tk.StringVar(value=cfg_get("top_lang_name"))
+        ttk.Entry(lang_frame, textvariable=self.top_name_var, width=15).grid(row=1, column=1, padx=2)
+
+        ttk.Label(lang_frame, text="Code:").grid(row=1, column=2, sticky="w", padx=(8, 4))
+        self.top_code_var = tk.StringVar(value=cfg_get("top_lang_code"))
+        ttk.Entry(lang_frame, textvariable=self.top_code_var, width=6).grid(row=1, column=3, padx=2)
+
+        ttk.Label(lang_frame, text="Tags (comma-sep):").grid(row=2, column=0, sticky="w", padx=(0, 4))
+        self.top_tags_var = tk.StringVar(value=cfg_get("top_lang_tags"))
+        ttk.Entry(lang_frame, textvariable=self.top_tags_var, width=35).grid(row=2, column=1, columnspan=3, sticky="ew", padx=2)
+
+        ttk.Separator(lang_frame, orient="horizontal").grid(row=3, column=0, columnspan=4, sticky="ew", pady=6)
+
+        ttk.Label(lang_frame, text="Bottom Language").grid(row=4, column=0, columnspan=4, sticky="w")
+
+        ttk.Label(lang_frame, text="Name:").grid(row=5, column=0, sticky="w", padx=(0, 4))
+        self.bot_name_var = tk.StringVar(value=cfg_get("bot_lang_name"))
+        ttk.Entry(lang_frame, textvariable=self.bot_name_var, width=15).grid(row=5, column=1, padx=2)
+
+        ttk.Label(lang_frame, text="Code:").grid(row=5, column=2, sticky="w", padx=(8, 4))
+        self.bot_code_var = tk.StringVar(value=cfg_get("bot_lang_code"))
+        ttk.Entry(lang_frame, textvariable=self.bot_code_var, width=6).grid(row=5, column=3, padx=2)
+
+        ttk.Label(lang_frame, text="Tags (comma-sep):").grid(row=6, column=0, sticky="w", padx=(0, 4))
+        self.bot_tags_var = tk.StringVar(value=cfg_get("bot_lang_tags"))
+        ttk.Entry(lang_frame, textvariable=self.bot_tags_var, width=35).grid(row=6, column=1, columnspan=3, sticky="ew", padx=2)
+
+        # --- Bottom Subtitle Style ---
+        style_frame = ttk.LabelFrame(self, text="Bottom Subtitle Style", padding=8)
+        style_frame.grid(row=row, column=0, sticky="ew", **pad)
+        row += 1
+
+        ttk.Label(style_frame, text="Text Color:").grid(row=0, column=0, sticky="w")
+        self.bot_color_var = tk.StringVar(value=cfg_get("bot_primary_colour"))
+        self._color_preview = tk.Canvas(style_frame, width=24, height=24, highlightthickness=1)
+        self._color_preview.grid(row=0, column=1, padx=4)
+        color_combo = ttk.Combobox(style_frame, textvariable=self.bot_color_var, width=20,
+                                   values=list(COLOR_PRESETS.values()))
+        color_combo.grid(row=0, column=2, padx=2)
+        ttk.Button(style_frame, text="Pick", width=5,
+                   command=lambda: self._pick_color(self.bot_color_var)).grid(row=0, column=3, padx=2)
+        self.bot_color_var.trace_add("write", lambda *_: self._update_color_preview())
+
+        ttk.Label(style_frame, text="Outline Color:").grid(row=1, column=0, sticky="w")
+        self.bot_outline_var = tk.StringVar(value=cfg_get("bot_outline_colour"))
+        self._outline_preview = tk.Canvas(style_frame, width=24, height=24, highlightthickness=1)
+        self._outline_preview.grid(row=1, column=1, padx=4)
+        ttk.Combobox(style_frame, textvariable=self.bot_outline_var, width=20,
+                     values=list(COLOR_PRESETS.values())).grid(row=1, column=2, padx=2)
+        ttk.Button(style_frame, text="Pick", width=5,
+                   command=lambda: self._pick_color(self.bot_outline_var)).grid(row=1, column=3, padx=2)
+        self.bot_outline_var.trace_add("write", lambda *_: self._update_color_preview())
+
+        ttk.Label(style_frame, text="Font Size Reduction:").grid(row=2, column=0, sticky="w")
+        self.fs_reduction_var = tk.IntVar(value=int(cfg_get("bot_fontsize_reduction")))
+        fs_spin = ttk.Spinbox(style_frame, from_=0, to=20, width=5, textvariable=self.fs_reduction_var)
+        fs_spin.grid(row=2, column=1, columnspan=2, sticky="w", padx=4)
+        ttk.Label(style_frame, text="px smaller than top").grid(row=2, column=2, columnspan=2, sticky="w")
+
+        # --- Output ---
+        out_frame = ttk.LabelFrame(self, text="Output", padding=8)
+        out_frame.grid(row=row, column=0, sticky="ew", **pad)
+        row += 1
+
+        ttk.Label(out_frame, text="Filename Pattern:").grid(row=0, column=0, sticky="w")
+        self.pattern_var = tk.StringVar(value=cfg_get("output_pattern"))
+        ttk.Entry(out_frame, textvariable=self.pattern_var, width=35).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Label(out_frame, text="Tokens: {basename} {lang}", foreground="gray").grid(
+            row=1, column=1, sticky="w", padx=4)
+
+        ttk.Label(out_frame, text="Track Title:").grid(row=2, column=0, sticky="w")
+        self.title_var = tk.StringVar(value=cfg_get("track_title"))
+        ttk.Entry(out_frame, textvariable=self.title_var, width=35).grid(row=2, column=1, sticky="ew", padx=4)
+
+        # --- Buttons ---
+        btn_frame = ttk.Frame(self)
+        btn_frame.grid(row=row, column=0, sticky="e", **pad)
+
+        ttk.Button(btn_frame, text="Reset Defaults", command=self._reset_defaults).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="Save", command=self._save).pack(side="right", padx=4)
+
+        self._update_color_preview()
+        self.columnconfigure(0, weight=1)
+
+    def _pick_color(self, var: tk.StringVar):
         try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            initial = ass_color_to_rgb(var.get())
         except Exception:
-            return {}
-    return {}
+            initial = "#FFFFFF"
+        result = colorchooser.askcolor(color=initial, parent=self, title="Choose Color")
+        if result and result[1]:
+            var.set(rgb_to_ass_color(result[1]))
 
+    def _update_color_preview(self):
+        try:
+            rgb = ass_color_to_rgb(self.bot_color_var.get())
+            self._color_preview.configure(bg=rgb)
+        except Exception:
+            self._color_preview.configure(bg="#000000")
+        try:
+            rgb = ass_color_to_rgb(self.bot_outline_var.get())
+            self._outline_preview.configure(bg=rgb)
+        except Exception:
+            self._outline_preview.configure(bg="#000000")
 
-def save_config(data: dict):
-    CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    def _reset_defaults(self):
+        self.top_name_var.set(DEFAULT_CONFIG["top_lang_name"])
+        self.top_code_var.set(DEFAULT_CONFIG["top_lang_code"])
+        self.top_tags_var.set(DEFAULT_CONFIG["top_lang_tags"])
+        self.bot_name_var.set(DEFAULT_CONFIG["bot_lang_name"])
+        self.bot_code_var.set(DEFAULT_CONFIG["bot_lang_code"])
+        self.bot_tags_var.set(DEFAULT_CONFIG["bot_lang_tags"])
+        self.bot_color_var.set(DEFAULT_CONFIG["bot_primary_colour"])
+        self.bot_outline_var.set(DEFAULT_CONFIG["bot_outline_colour"])
+        self.fs_reduction_var.set(DEFAULT_CONFIG["bot_fontsize_reduction"])
+        self.pattern_var.set(DEFAULT_CONFIG["output_pattern"])
+        self.title_var.set(DEFAULT_CONFIG["track_title"])
 
+    def _save(self):
+        cfg_set("top_lang_name", self.top_name_var.get().strip())
+        cfg_set("top_lang_code", self.top_code_var.get().strip())
+        cfg_set("top_lang_tags", self.top_tags_var.get().strip())
+        cfg_set("bot_lang_name", self.bot_name_var.get().strip())
+        cfg_set("bot_lang_code", self.bot_code_var.get().strip())
+        cfg_set("bot_lang_tags", self.bot_tags_var.get().strip())
+        cfg_set("bot_primary_colour", self.bot_color_var.get().strip())
+        cfg_set("bot_outline_colour", self.bot_outline_var.get().strip())
+        cfg_set("bot_fontsize_reduction", self.fs_reduction_var.get())
+        cfg_set("output_pattern", self.pattern_var.get().strip() or DEFAULT_CONFIG["output_pattern"])
+        cfg_set("track_title", self.title_var.get().strip() or DEFAULT_CONFIG["track_title"])
+        cfg_save()
+        self.result = True
+        self.destroy()
 
-def load_templates() -> dict[str, str]:
-    return load_config().get("templates", {})
-
-
-def save_templates(templates: dict[str, str]):
-    cfg = load_config()
-    cfg["templates"] = templates
-    save_config(cfg)
 
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
 def _parse_dnd_paths(data: str) -> list[Path]:
-    """Extract file paths from a tkdnd drop event data string.
-
-    Tk wraps paths containing spaces in curly braces and separates
-    multiple paths with spaces.
-    """
     paths: list[Path] = []
     raw = data.strip()
     i = 0
@@ -953,9 +1115,21 @@ def _parse_dnd_paths(data: str) -> list[Path]:
 class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Batch SRT to ASS Converter")
-        self.minsize(860, 640)
+        self.title("Subtitle Merger")
+        self.minsize(900, 680)
         self.resizable(True, True)
+
+        if HAS_THEME:
+            sv_ttk.set_theme("dark")
+
+        geo = cfg_get("window_geometry")
+        if geo:
+            try:
+                self.geometry(geo)
+            except Exception:
+                pass
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.pairs: list[tuple[str, str, float]] = []
         self.unmatched_top: list[str] = []
@@ -968,20 +1142,52 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.bot_file_paths: dict[str, Path] = {}
         self.saved_templates: dict[str, str] = load_templates()
         self._intermediate_files: list[Path] = []
+        self._last_output_dir: Path | None = None
+        self._converting = False
 
         self._build_ui()
+        self._bind_shortcuts()
+
+    def _on_close(self):
+        cfg_set("window_geometry", self.geometry())
+        cfg_save()
+        self.destroy()
+
+    def _bind_shortcuts(self):
+        self.bind_all("<Control-o>", lambda e: self._browse_mkv())
+        self.bind_all("<Control-m>", lambda e: self._auto_match())
+        self.bind_all("<Control-Return>", lambda e: self._convert_all())
+        self.bind_all("<Delete>", lambda e: self._remove_pair())
+        self.bind_all("<Control-comma>", lambda e: self._open_settings())
 
     # ---- UI construction ----
 
     def _build_ui(self):
         pad = dict(padx=8, pady=4)
 
+        # -- Menu bar --
+        menubar = tk.Menu(self)
+        self.configure(menu=menubar)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Open MKV...  (Ctrl+O)", command=self._browse_mkv)
+        file_menu.add_separator()
+        file_menu.add_command(label="Settings...  (Ctrl+,)", command=self._open_settings)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Keyboard Shortcuts", command=self._show_shortcuts)
+        help_menu.add_command(label="About", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+
         # -- MKV drop zone --
         mkv_frame = ttk.LabelFrame(self, text="MKV Import", padding=6)
         mkv_frame.pack(fill="x", **pad)
         self.mkv_label = ttk.Label(
             mkv_frame,
-            text="Drag MKV file(s) here or click Browse to extract subtitles",
+            text="Drag MKV file(s) here or click Browse (Ctrl+O)",
             anchor="center", padding=10, relief="groove",
         )
         self.mkv_label.pack(side="left", fill="x", expand=True)
@@ -998,12 +1204,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         mode_frame.pack(fill="x", **pad)
         self.mode_var = tk.StringVar(value="folder")
         ttk.Label(mode_frame, text="Mode:").pack(side="left", padx=(0, 6))
-        ttk.Radiobutton(mode_frame, text="Folder Mode", variable=self.mode_var,
-                         value="folder", command=self._toggle_mode).pack(side="left", padx=4)
-        ttk.Radiobutton(mode_frame, text="File Mode", variable=self.mode_var,
-                         value="file", command=self._toggle_mode).pack(side="left", padx=4)
-        ttk.Radiobutton(mode_frame, text="ASS Merge Mode", variable=self.mode_var,
-                         value="ass_merge", command=self._toggle_mode).pack(side="left", padx=4)
+        self._folder_radio = ttk.Radiobutton(mode_frame, text="Folder Mode", variable=self.mode_var,
+                         value="folder", command=self._toggle_mode)
+        self._folder_radio.pack(side="left", padx=4)
+        self._file_radio = ttk.Radiobutton(mode_frame, text="File Mode", variable=self.mode_var,
+                         value="file", command=self._toggle_mode)
+        self._file_radio.pack(side="left", padx=4)
+        self._ass_radio = ttk.Radiobutton(mode_frame, text="ASS Merge Mode", variable=self.mode_var,
+                         value="ass_merge", command=self._toggle_mode)
+        self._ass_radio.pack(side="left", padx=4)
+        ttk.Button(mode_frame, text="\u2699 Settings", command=self._open_settings).pack(side="right", padx=4)
 
         # -- Container that swaps between folder / file UI --
         self.input_container = ttk.Frame(self)
@@ -1016,7 +1226,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tpl_top_row = ttk.Frame(tpl_outer)
         tpl_top_row.pack(fill="x")
         ttk.Label(tpl_top_row, text="Template .ass:").pack(side="left")
-        self.tpl_var = tk.StringVar()
+        self.tpl_var = tk.StringVar(value=cfg_get("last_tpl_path"))
         tpl_entry = ttk.Entry(tpl_top_row, textvariable=self.tpl_var, width=50)
         tpl_entry.pack(side="left", fill="x", expand=True, padx=4)
         ttk.Button(tpl_top_row, text="Browse", command=self._browse_tpl).pack(side="left")
@@ -1035,7 +1245,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._refresh_template_combo()
 
         # -- Auto-Match button --
-        self._auto_match_btn = ttk.Button(self, text="Auto-Match", command=self._auto_match)
+        self._auto_match_btn = ttk.Button(self, text="Auto-Match (Ctrl+M)", command=self._auto_match)
         self._auto_match_btn.pack(anchor="e", padx=12, pady=(4, 2))
 
         # -- Results table --
@@ -1045,12 +1255,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         cols = ("#", "top_srt", "bot_srt", "conf")
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
         self.tree.heading("#", text="#", anchor="center")
-        self.tree.heading("top_srt", text="Top SRT", anchor="w")
-        self.tree.heading("bot_srt", text="Bot SRT", anchor="w")
+        self.tree.heading("top_srt", text=f"Top ({cfg_get('top_lang_name')})", anchor="w")
+        self.tree.heading("bot_srt", text=f"Bot ({cfg_get('bot_lang_name')})", anchor="w")
         self.tree.heading("conf", text="Conf.", anchor="center")
         self.tree.column("#", width=40, minwidth=30, stretch=False, anchor="center")
-        self.tree.column("top_srt", width=280, minwidth=120)
-        self.tree.column("bot_srt", width=280, minwidth=120)
+        self.tree.column("top_srt", width=300, minwidth=120)
+        self.tree.column("bot_srt", width=300, minwidth=120)
         self.tree.column("conf", width=70, minwidth=50, stretch=False, anchor="center")
 
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
@@ -1063,34 +1273,63 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         btn_row.pack(fill="x", **pad)
         ttk.Button(btn_row, text="Edit Pair", command=self._edit_pair).pack(side="left", padx=4)
         ttk.Button(btn_row, text="Remove Pair", command=self._remove_pair).pack(side="left", padx=4)
-        ttk.Button(btn_row, text="Convert All", command=self._convert_all).pack(side="right", padx=4)
+        self._convert_btn = ttk.Button(btn_row, text="Convert All (Ctrl+Enter)", command=self._convert_all)
+        self._convert_btn.pack(side="right", padx=4)
+        self._open_folder_btn = ttk.Button(btn_row, text="Open Output Folder", command=self._open_output_folder, state="disabled")
+        self._open_folder_btn.pack(side="right", padx=4)
         self.cleanup_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(btn_row, text="Clean up intermediate files",
                          variable=self.cleanup_var).pack(side="right", padx=8)
 
+        # -- Status bar with progress --
+        status_frame = ttk.Frame(self)
+        status_frame.pack(fill="x", side="bottom", **pad)
+
+        self.progress = ttk.Progressbar(status_frame, mode="determinate", length=200)
+        self.progress.pack(side="right", padx=(8, 0))
+        self.progress.pack_forget()
+
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w", padding=4).pack(
-            fill="x", side="bottom", **pad
-        )
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, relief="sunken", anchor="w", padding=4)
+        self.status_label.pack(fill="x", side="left", expand=True)
 
         self._build_folder_ui()
         self._build_file_ui()
         self._build_ass_merge_ui()
         self._toggle_mode()
 
+    def _update_dynamic_labels(self):
+        top_name = cfg_get("top_lang_name")
+        bot_name = cfg_get("bot_lang_name")
+        self.tree.heading("top_srt", text=f"Top ({top_name})")
+        self.tree.heading("bot_srt", text=f"Bot ({bot_name})")
+        self._folder_radio.configure(text="Folder Mode")
+        self._file_radio.configure(text="File Mode")
+        self._ass_radio.configure(text="ASS Merge Mode")
+        if hasattr(self, "folder_frame"):
+            for widget in self.folder_frame.winfo_children():
+                if isinstance(widget, ttk.Label):
+                    text = widget.cget("text")
+                    if "Top Folder" in text:
+                        widget.configure(text=f"Top Folder ({top_name}):")
+                    elif "Bot Folder" in text:
+                        widget.configure(text=f"Bot Folder ({bot_name}):")
+
     # -- Folder mode UI --
 
     def _build_folder_ui(self):
         self.folder_frame = ttk.LabelFrame(self.input_container, text="Folders", padding=8)
+        top_name = cfg_get("top_lang_name")
+        bot_name = cfg_get("bot_lang_name")
 
-        ttk.Label(self.folder_frame, text="Top Folder (English):").grid(row=0, column=0, sticky="w")
-        self.top_dir_var = tk.StringVar()
+        ttk.Label(self.folder_frame, text=f"Top Folder ({top_name}):").grid(row=0, column=0, sticky="w")
+        self.top_dir_var = tk.StringVar(value=cfg_get("last_top_dir"))
         top_entry = ttk.Entry(self.folder_frame, textvariable=self.top_dir_var, width=55)
         top_entry.grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(self.folder_frame, text="Browse", command=self._browse_top_dir).grid(row=0, column=2)
 
-        ttk.Label(self.folder_frame, text="Bot Folder (Other):").grid(row=1, column=0, sticky="w")
-        self.bot_dir_var = tk.StringVar()
+        ttk.Label(self.folder_frame, text=f"Bot Folder ({bot_name}):").grid(row=1, column=0, sticky="w")
+        self.bot_dir_var = tk.StringVar(value=cfg_get("last_bot_dir"))
         bot_entry = ttk.Entry(self.folder_frame, textvariable=self.bot_dir_var, width=55)
         bot_entry.grid(row=1, column=1, sticky="ew", padx=4)
         ttk.Button(self.folder_frame, text="Browse", command=self._browse_bot_dir).grid(row=1, column=2)
@@ -1106,11 +1345,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _build_file_ui(self):
         self.file_frame = ttk.Frame(self.input_container)
+        top_name = cfg_get("top_lang_name")
+        bot_name = cfg_get("bot_lang_name")
 
-        # Two side-by-side listboxes
         for col, (label_text, attr, add_cmd, clear_attr) in enumerate([
-            ("Top SRT Files (English)", "top_listbox", "_browse_top_files", "top"),
-            ("Bot SRT Files (Other)", "bot_listbox", "_browse_bot_files", "bot"),
+            (f"Top SRT Files ({top_name})", "top_listbox", "_browse_top_files", "top"),
+            (f"Bot SRT Files ({bot_name})", "bot_listbox", "_browse_bot_files", "bot"),
         ]):
             col_frame = ttk.LabelFrame(self.file_frame, text=label_text, padding=4)
             col_frame.grid(row=0, column=col, sticky="nsew", padx=4)
@@ -1140,10 +1380,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _build_ass_merge_ui(self):
         self.ass_merge_frame = ttk.Frame(self.input_container)
+        top_name = cfg_get("top_lang_name")
+        bot_name = cfg_get("bot_lang_name")
 
         for col, (label_text, attr, add_cmd) in enumerate([
-            ("English ASS Files", "ass_top_listbox", "_browse_ass_top_files"),
-            ("Portuguese ASS Files", "ass_bot_listbox", "_browse_ass_bot_files"),
+            (f"{top_name} ASS Files", "ass_top_listbox", "_browse_ass_top_files"),
+            (f"{bot_name} ASS Files", "ass_bot_listbox", "_browse_ass_bot_files"),
         ]):
             col_frame = ttk.LabelFrame(self.ass_merge_frame, text=label_text, padding=4)
             col_frame.grid(row=0, column=col, sticky="nsew", padx=4)
@@ -1169,7 +1411,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         sign_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
         self.sign_mode_var = tk.StringVar(value="shift")
         ttk.Radiobutton(
-            sign_frame, text="Shift below English (keep original position, offset to avoid overlap)",
+            sign_frame, text="Shift below top language (keep position, offset to avoid overlap)",
             variable=self.sign_mode_var, value="shift",
         ).pack(anchor="w")
         ttk.Radiobutton(
@@ -1197,6 +1439,35 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self.ass_merge_frame.pack(fill="both", expand=True)
             self.tpl_frame.pack_forget()
 
+    # ---- Settings ----
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self)
+        self.wait_window(dlg)
+        if dlg.result:
+            self._update_dynamic_labels()
+            self.status_var.set("Settings saved.")
+
+    def _show_shortcuts(self):
+        messagebox.showinfo("Keyboard Shortcuts",
+            "Ctrl+O  —  Browse MKV\n"
+            "Ctrl+M  —  Auto-Match\n"
+            "Ctrl+Enter  —  Convert All\n"
+            "Delete  —  Remove selected pair\n"
+            "Ctrl+,  —  Open Settings",
+            parent=self,
+        )
+
+    def _show_about(self):
+        messagebox.showinfo("About Subtitle Merger",
+            "Subtitle Merger v1.2.0\n\n"
+            "Batch dual-subtitle merger with\n"
+            "MKV extraction, style management,\n"
+            "and Plex-compatible output.\n\n"
+            "github.com/CoolFreeze23/subtitle-merger",
+            parent=self,
+        )
+
     # ---- Drag-and-drop helpers ----
 
     @staticmethod
@@ -1218,11 +1489,15 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     # ---- MKV import ----
 
     def _browse_mkv(self):
+        initial = cfg_get("last_mkv_dir") or ""
         files = filedialog.askopenfilenames(
             title="Select MKV file(s)",
+            initialdir=initial or None,
             filetypes=[("MKV files", "*.mkv"), ("All video", "*.mkv;*.mp4;*.avi;*.ts"), ("All files", "*.*")],
         )
         if files:
+            cfg_set("last_mkv_dir", str(Path(files[0]).parent))
+            cfg_save()
             self._process_mkvs([Path(f) for f in files])
 
     def _on_drop_mkv(self, event):
@@ -1262,28 +1537,32 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 tracks, skip_forced=self.skip_forced_var.get(),
             )
 
-            eng_pick = self._resolve_track(mkv.name, "English (Top)", eng_tracks, tracks)
+            top_lang = cfg_get("top_lang_name")
+            bot_lang = cfg_get("bot_lang_name")
+            eng_pick = self._resolve_track(mkv.name, f"{top_lang} (Top)", eng_tracks, tracks)
             if eng_pick is None:
                 continue
-            por_pick = self._resolve_track(mkv.name, "Portuguese (Bot)", por_tracks, tracks)
+            por_pick = self._resolve_track(mkv.name, f"{bot_lang} (Bot)", por_tracks, tracks)
             if por_pick is None:
                 continue
 
             stem = mkv.stem
+            top_code = cfg_get("top_lang_code")
+            bot_code = cfg_get("bot_lang_code")
             eng_codec = eng_pick.get("codec", "srt")
             por_codec = por_pick.get("codec", "srt")
             eng_ext = ".ass" if eng_codec in ("ass", "ssa") else ".srt"
             por_ext = ".ass" if por_codec in ("ass", "ssa") else ".srt"
 
-            eng_out = mkv.parent / f"{stem}.en{eng_ext}"
-            por_out = mkv.parent / f"{stem}.pt{por_ext}"
+            eng_out = mkv.parent / f"{stem}.{top_code}{eng_ext}"
+            por_out = mkv.parent / f"{stem}.{bot_code}{por_ext}"
 
             try:
-                self.status_var.set(f"Extracting English from {mkv.name}...")
+                self.status_var.set(f"Extracting {top_lang} from {mkv.name}...")
                 self.update_idletasks()
                 eng_out = extract_subtitle(mkv, eng_pick["index"], eng_out, eng_codec)
 
-                self.status_var.set(f"Extracting Portuguese from {mkv.name}...")
+                self.status_var.set(f"Extracting {bot_lang} from {mkv.name}...")
                 self.update_idletasks()
                 por_out = extract_subtitle(mkv, por_pick["index"], por_out, por_codec)
             except Exception as e:
@@ -1336,7 +1615,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _resolve_track(self, mkv_name: str, label: str,
                        candidates: list[dict], all_tracks: list[dict]) -> dict | None:
-        """Pick a single track. Auto-selects if exactly one candidate, otherwise prompts."""
         if len(candidates) == 1:
             return candidates[0]
         if len(candidates) == 0:
@@ -1353,7 +1631,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _pick_track_dialog(self, mkv_name: str, label: str,
                            message: str, tracks: list[dict]) -> dict | None:
-        """Show a dialog for the user to pick a subtitle track."""
         dlg = tk.Toplevel(self)
         dlg.title(f"Select {label} - {mkv_name}")
         dlg.resizable(False, False)
@@ -1488,26 +1765,39 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     # ---- Browse callbacks ----
 
     def _browse_top_dir(self):
-        d = filedialog.askdirectory(title="Select Top (English) SRT folder")
+        initial = cfg_get("last_top_dir") or ""
+        d = filedialog.askdirectory(title=f"Select Top ({cfg_get('top_lang_name')}) SRT folder",
+                                    initialdir=initial or None)
         if d:
             self.top_dir_var.set(d)
+            cfg_set("last_top_dir", d)
+            cfg_save()
 
     def _browse_bot_dir(self):
-        d = filedialog.askdirectory(title="Select Bot (other language) SRT folder")
+        initial = cfg_get("last_bot_dir") or ""
+        d = filedialog.askdirectory(title=f"Select Bot ({cfg_get('bot_lang_name')}) SRT folder",
+                                    initialdir=initial or None)
         if d:
             self.bot_dir_var.set(d)
+            cfg_set("last_bot_dir", d)
+            cfg_save()
 
     def _browse_tpl(self):
+        initial = cfg_get("last_tpl_path")
+        initial_dir = str(Path(initial).parent) if initial else None
         f = filedialog.askopenfilename(
             title="Select template .ass file",
+            initialdir=initial_dir,
             filetypes=[("ASS files", "*.ass"), ("All files", "*.*")],
         )
         if f:
             self.tpl_var.set(f)
+            cfg_set("last_tpl_path", f)
+            cfg_save()
 
     def _browse_top_files(self):
         files = filedialog.askopenfilenames(
-            title="Select Top (English) SRT files",
+            title=f"Select Top ({cfg_get('top_lang_name')}) SRT files",
             filetypes=[("SRT files", "*.srt"), ("All files", "*.*")],
         )
         for f in files:
@@ -1519,7 +1809,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _browse_bot_files(self):
         files = filedialog.askopenfilenames(
-            title="Select Bot (other language) SRT files",
+            title=f"Select Bot ({cfg_get('bot_lang_name')}) SRT files",
             filetypes=[("SRT files", "*.srt"), ("All files", "*.*")],
         )
         for f in files:
@@ -1531,7 +1821,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _browse_ass_top_files(self):
         files = filedialog.askopenfilenames(
-            title="Select English ASS files",
+            title=f"Select {cfg_get('top_lang_name')} ASS files",
             filetypes=[("ASS files", "*.ass;*.ssa"), ("All files", "*.*")],
         )
         for f in files:
@@ -1543,7 +1833,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _browse_ass_bot_files(self):
         files = filedialog.askopenfilenames(
-            title="Select Portuguese ASS files",
+            title=f"Select {cfg_get('bot_lang_name')} ASS files",
             filetypes=[("ASS files", "*.ass;*.ssa"), ("All files", "*.*")],
         )
         for f in files:
@@ -1572,6 +1862,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if not self.styles:
             messagebox.showerror("Template error", "No [V4+ Styles] section found in template.")
             return False
+        cfg_set("last_tpl_path", tpl_path)
+        cfg_save()
         return True
 
     def _auto_match(self):
@@ -1620,10 +1912,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         top_names = sorted(self.top_file_paths.keys())
         bot_names = sorted(self.bot_file_paths.keys())
         if not top_names:
-            messagebox.showwarning("No files", "Add Top SRT files first.")
+            messagebox.showwarning("No files", "Add Top files first.")
             return
         if not bot_names:
-            messagebox.showwarning("No files", "Add Bot SRT files first.")
+            messagebox.showwarning("No files", "Add Bot files first.")
             return
 
         self.pairs, self.unmatched_top, self.unmatched_bot = match_files(top_names, bot_names)
@@ -1712,13 +2004,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _remove_pair(self):
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo("No selection", "Select a paired row first.")
             return
         iid = sel[0]
         try:
             idx = int(iid) - 1
         except ValueError:
-            messagebox.showinfo("Invalid", "Select a paired row, not an unmatched entry.")
             return
         if idx < 0 or idx >= len(self.pairs):
             return
@@ -1729,18 +2019,42 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._refresh_table()
         self.status_var.set(f"Removed pair. {len(self.pairs)} pair(s) remaining.")
 
-    # ---- Convert ----
+    # ---- Open output folder ----
+
+    def _open_output_folder(self):
+        if self._last_output_dir and self._last_output_dir.is_dir():
+            if sys.platform == "win32":
+                os.startfile(str(self._last_output_dir))
+            else:
+                subprocess.Popen(["xdg-open", str(self._last_output_dir)])
+
+    # ---- Convert (threaded) ----
 
     def _convert_all(self):
+        if self._converting:
+            return
         if not self.pairs:
             messagebox.showwarning("Nothing to convert", "No pairs to convert. Run Auto-Match first.")
             return
 
+        self._converting = True
+        self._convert_btn.configure(state="disabled")
+        self.progress.pack(side="right", padx=(8, 0))
+        self.progress["maximum"] = len(self.pairs)
+        self.progress["value"] = 0
+
+        thread = threading.Thread(target=self._convert_worker, daemon=True)
+        thread.start()
+
+    def _convert_worker(self):
         converted = 0
         errors = []
         out_dir: Path | None = None
+        dupe_warnings: list[str] = []
 
-        for tf, bf, _ in self.pairs:
+        for i, (tf, bf, _) in enumerate(self.pairs):
+            self.after(0, self._update_progress, i, tf)
+
             top_path = self.top_file_paths.get(tf)
             bot_path = self.bot_file_paths.get(bf)
             if not top_path or not bot_path:
@@ -1759,11 +2073,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     eng_info, eng_styles, eng_events = parse_ass_sections(top_path)
                     por_info, por_styles, por_events = parse_ass_sections(bot_path)
                     if not eng_events:
-                        errors.append(f"{tf}: no events parsed (English)")
+                        errors.append(f"{tf}: no events parsed (Top)")
                         continue
                     if not por_events:
-                        errors.append(f"{bf}: no events parsed (Portuguese)")
+                        errors.append(f"{bf}: no events parsed (Bot)")
                         continue
+
+                    dupes = _check_duplicate_styles(eng_styles, por_styles)
+                    if dupes:
+                        dupe_warnings.append(f"{tf}: duplicate styles: {', '.join(dupes[:5])}")
+
                     merge_info = eng_info if eng_info else self.script_info
                     s_mode = getattr(self, "sign_mode_var", None)
                     ass_content = build_ass_merged(
@@ -1800,17 +2119,39 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                     pass
             self._intermediate_files.clear()
 
+        self.after(0, self._convert_done, converted, errors, out_dir, cleaned, dupe_warnings)
+
+    def _update_progress(self, index: int, filename: str):
+        self.progress["value"] = index
+        self.status_var.set(f"Converting {index + 1}/{len(self.pairs)}: {filename}")
+
+    def _convert_done(self, converted: int, errors: list[str],
+                      out_dir: Path | None, cleaned: int, dupe_warnings: list[str]):
+        self._converting = False
+        self._convert_btn.configure(state="normal")
+        self.progress["value"] = self.progress["maximum"]
+
+        self._last_output_dir = out_dir
+        if out_dir:
+            self._open_folder_btn.configure(state="normal")
+
         msg = f"Converted {converted}/{len(self.pairs)} pair(s)."
         if cleaned:
             msg += f"\nCleaned up {cleaned} intermediate file(s)."
+        if dupe_warnings:
+            msg += "\n\nDuplicate style warnings:\n" + "\n".join(dupe_warnings)
         if errors:
             msg += "\n\nErrors:\n" + "\n".join(errors)
+
         where = out_dir or "output folder"
         self.status_var.set(f"Done! {converted} file(s) written to {where}")
         messagebox.showinfo("Conversion complete", msg)
 
+        self.after(2000, lambda: self.progress.pack_forget())
+
 
 def main():
+    init_config()
     app = App()
     app.mainloop()
 
