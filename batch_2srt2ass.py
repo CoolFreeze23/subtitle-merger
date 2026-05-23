@@ -308,8 +308,12 @@ def match_files(
     return pairs, unmatched_top, unmatched_bot
 
 
+INTERMEDIATE_SUFFIXES = re.compile(r"\.prepared$", re.IGNORECASE)
+
+
 def output_name(top_srt: str) -> str:
     stem = Path(top_srt).stem
+    stem = INTERMEDIATE_SUFFIXES.sub("", stem)
     cleaned = LANG_SUFFIXES.sub("", stem)
     cleaned = LANG_SUFFIXES.sub("", cleaned)
     pattern = cfg_get("output_pattern")
