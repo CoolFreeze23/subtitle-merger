@@ -347,12 +347,12 @@ def probe_subtitles(mkv_path: Path) -> list[dict]:
         "-show_streams", "-select_streams", "s",
         str(mkv_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True,
+    result = subprocess.run(cmd, capture_output=True,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode != 0:
-        raise RuntimeError(f"ffprobe failed:\n{result.stderr}")
+        raise RuntimeError(f"ffprobe failed:\n{result.stderr.decode('utf-8', errors='replace')}")
 
-    stdout = (result.stdout or "").strip()
+    stdout = result.stdout.decode("utf-8", errors="replace").strip() if result.stdout else ""
     if not stdout:
         return []
     data = json.loads(stdout)
@@ -385,10 +385,10 @@ def extract_subtitle(mkv_path: Path, stream_index: int, out_path: Path,
         "-c:s", "copy" if is_ass else "srt",
         str(out_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True,
+    result = subprocess.run(cmd, capture_output=True,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg extraction failed:\n{result.stderr}")
+        raise RuntimeError(f"ffmpeg extraction failed:\n{result.stderr.decode('utf-8', errors='replace')}")
     return out_path
 
 
