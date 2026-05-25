@@ -1625,33 +1625,45 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             if por_pick is None:
                 continue
 
+            eng_skipped = eng_pick is self._SKIP_TRACK
+            por_skipped = por_pick is self._SKIP_TRACK
+            if eng_skipped and por_skipped:
+                self.status_var.set(f"Both languages skipped for {mkv.name}")
+                continue
+
             stem = mkv.stem
             top_code = cfg_get("top_lang_code")
             bot_code = cfg_get("bot_lang_code")
-            eng_codec = eng_pick.get("codec", "srt")
-            por_codec = por_pick.get("codec", "srt")
-            eng_ext = ".ass" if eng_codec in ("ass", "ssa") else ".srt"
-            por_ext = ".ass" if por_codec in ("ass", "ssa") else ".srt"
 
-            eng_out = mkv.parent / f"{stem}.{top_code}{eng_ext}"
-            por_out = mkv.parent / f"{stem}.{bot_code}{por_ext}"
+            eng_out: Path | None = None
+            por_out: Path | None = None
+            eng_ext = ""
+            por_ext = ""
 
             try:
-                self.status_var.set(f"Extracting {top_lang} from {mkv.name}...")
-                self.update_idletasks()
-                eng_out = extract_subtitle(mkv, eng_pick["index"], eng_out, eng_codec)
+                if not eng_skipped:
+                    eng_codec = eng_pick.get("codec", "srt")
+                    eng_ext = ".ass" if eng_codec in ("ass", "ssa") else ".srt"
+                    eng_out = mkv.parent / f"{stem}.{top_code}{eng_ext}"
+                    self.status_var.set(f"Extracting {top_lang} from {mkv.name}...")
+                    self.update_idletasks()
+                    eng_out = extract_subtitle(mkv, eng_pick["index"], eng_out, eng_codec)
+                    self._intermediate_files.append(eng_out)
 
-                self.status_var.set(f"Extracting {bot_lang} from {mkv.name}...")
-                self.update_idletasks()
-                por_out = extract_subtitle(mkv, por_pick["index"], por_out, por_codec)
+                if not por_skipped:
+                    por_codec = por_pick.get("codec", "srt")
+                    por_ext = ".ass" if por_codec in ("ass", "ssa") else ".srt"
+                    por_out = mkv.parent / f"{stem}.{bot_code}{por_ext}"
+                    self.status_var.set(f"Extracting {bot_lang} from {mkv.name}...")
+                    self.update_idletasks()
+                    por_out = extract_subtitle(mkv, por_pick["index"], por_out, por_codec)
+                    self._intermediate_files.append(por_out)
             except Exception as e:
                 messagebox.showerror("Extraction failed", f"{mkv.name}:\n{e}")
                 continue
 
-            self._intermediate_files.append(eng_out)
-            self._intermediate_files.append(por_out)
-
-            both_ass = eng_ext == ".ass" and por_ext == ".ass"
+            both_extracted = eng_out is not None and por_out is not None
+            both_ass = both_extracted and eng_ext == ".ass" and por_ext == ".ass"
             if both_ass:
                 any_ass = True
                 self.status_var.set(f"Preparing ASS files for {mkv.name}...")
@@ -1666,20 +1678,47 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 except Exception as e:
                     messagebox.showerror("Preparation failed", f"{mkv.name}:\n{e}")
                     continue
+            elif eng_out and eng_ext == ".ass" and por_skipped:
+                any_ass = True
+                self.status_var.set(f"Preparing {top_lang} ASS for {mkv.name}...")
+                self.update_idletasks()
+                try:
+                    eng_prepared = prepare_ass_for_merge(eng_out, is_portuguese=False)
+                    self._intermediate_files.append(eng_prepared)
+                    eng_out = eng_prepared
+                except Exception as e:
+                    messagebox.showerror("Preparation failed", f"{mkv.name}:\n{e}")
+                    continue
+            elif por_out and por_ext == ".ass" and eng_skipped:
+                any_ass = True
+                self.status_var.set(f"Preparing {bot_lang} ASS for {mkv.name}...")
+                self.update_idletasks()
+                try:
+                    por_prepared = prepare_ass_for_merge(por_out, is_portuguese=True)
+                    self._intermediate_files.append(por_prepared)
+                    por_out = por_prepared
+                except Exception as e:
+                    messagebox.showerror("Preparation failed", f"{mkv.name}:\n{e}")
+                    continue
 
-            eng_name = eng_out.name
-            por_name = por_out.name
-            if eng_name not in self.top_file_paths:
-                self.top_file_paths[eng_name] = eng_out
-            if por_name not in self.bot_file_paths:
-                self.bot_file_paths[por_name] = por_out
+            if eng_out:
+                eng_name = eng_out.name
+                if eng_name not in self.top_file_paths:
+                    self.top_file_paths[eng_name] = eng_out
+                if any_ass:
+                    self.ass_top_listbox.insert("end", eng_name)
+                else:
+                    self.top_listbox.insert("end", eng_name)
 
-            if both_ass:
-                self.ass_top_listbox.insert("end", eng_name)
-                self.ass_bot_listbox.insert("end", por_name)
-            else:
-                self.top_listbox.insert("end", eng_name)
-                self.bot_listbox.insert("end", por_name)
+            if por_out:
+                por_name = por_out.name
+                if por_name not in self.bot_file_paths:
+                    self.bot_file_paths[por_name] = por_out
+                if any_ass:
+                    self.ass_bot_listbox.insert("end", por_name)
+                else:
+                    self.bot_listbox.insert("end", por_name)
+
             extracted += 1
 
         if any_ass:
@@ -1690,7 +1729,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._update_file_count()
         if extracted:
-            self.status_var.set(f"Extracted subtitles from {extracted} file(s). Click Auto-Match to pair.")
+            skipped_any = any(
+                p is self._SKIP_TRACK for p in (eng_pick, por_pick)
+            ) if extracted == 1 else False
+            hint = " Add external files for skipped languages, then Auto-Match." if skipped_any else " Click Auto-Match to pair."
+            self.status_var.set(f"Extracted subtitles from {extracted} file(s).{hint}")
 
     def _resolve_track(self, mkv_name: str, label: str,
                        candidates: list[dict], all_tracks: list[dict],
@@ -1729,15 +1772,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if len(candidates) == 0:
             pick = self._pick_track_dialog(
                 mkv_name, label,
-                f"No {label.split('(')[0].strip()} tracks auto-detected.\nChoose manually:",
-                all_tracks,
+                f"No {label.split('(')[0].strip()} tracks auto-detected.\n"
+                "Choose manually, or skip to use an external file:",
+                all_tracks, allow_skip=True,
             )
         else:
             pick = self._pick_track_dialog(
                 mkv_name, label,
-                f"Multiple {label.split('(')[0].strip()} tracks found.\nChoose one:",
-                candidates,
+                f"Multiple {label.split('(')[0].strip()} tracks found.\n"
+                "Choose one, or skip to use an external file:",
+                candidates, allow_skip=True,
             )
+
+        if pick is self._SKIP_TRACK:
+            return pick
 
         if pick is not None:
             if is_top:
@@ -1746,8 +1794,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 self._remembered_bot = pick
         return pick
 
+    _SKIP_TRACK = {"__skip__": True}
+
     def _pick_track_dialog(self, mkv_name: str, label: str,
-                           message: str, tracks: list[dict]) -> dict | None:
+                           message: str, tracks: list[dict],
+                           allow_skip: bool = False) -> dict | None:
         dlg = tk.Toplevel(self)
         dlg.title(f"Select {label} - {mkv_name}")
         dlg.resizable(False, False)
@@ -1786,6 +1837,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 result[0] = next((t for t in tracks if t["index"] == idx), None)
             dlg.destroy()
 
+        def on_skip():
+            result[0] = self._SKIP_TRACK
+            dlg.destroy()
+
         def on_cancel():
             dlg.destroy()
 
@@ -1793,6 +1848,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         bf.pack(fill="x", padx=8, pady=8)
         ttk.Button(bf, text="OK", command=on_ok).pack(side="right", padx=4)
         ttk.Button(bf, text="Cancel", command=on_cancel).pack(side="right", padx=4)
+        if allow_skip:
+            ttk.Button(bf, text="Skip — use external file",
+                       command=on_skip).pack(side="left", padx=4)
 
         dlg.wait_window()
         return result[0]
