@@ -2285,11 +2285,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             except Exception as e:
                 errors.append(f"{tf}: {e}")
 
+        output_paths: set[Path] = set()
+        for tf, bf, _ in self.pairs:
+            tp = self.top_file_paths.get(tf)
+            if tp:
+                output_paths.add((tp.parent / output_name(tf)).resolve())
+
         cleaned = 0
         if self.cleanup_var.get() and converted > 0:
             for f in self._intermediate_files:
                 try:
-                    if f.is_file():
+                    if f.is_file() and f.resolve() not in output_paths:
                         f.unlink()
                         cleaned += 1
                 except OSError:
