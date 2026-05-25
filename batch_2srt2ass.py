@@ -308,7 +308,7 @@ def match_files(
     return pairs, unmatched_top, unmatched_bot
 
 
-INTERMEDIATE_SUFFIXES = re.compile(r"\.prepared$", re.IGNORECASE)
+INTERMEDIATE_SUFFIXES = re.compile(r"(?:_extracted)?(?:\.prepared)?$", re.IGNORECASE)
 
 
 def output_name(top_srt: str) -> str:
@@ -1644,7 +1644,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 if not eng_skipped:
                     eng_codec = eng_pick.get("codec", "srt")
                     eng_ext = ".ass" if eng_codec in ("ass", "ssa") else ".srt"
-                    eng_out = mkv.parent / f"{stem}.{top_code}{eng_ext}"
+                    eng_out = mkv.parent / f"{stem}.{top_code}_extracted{eng_ext}"
                     self.status_var.set(f"Extracting {top_lang} from {mkv.name}...")
                     self.update_idletasks()
                     eng_out = extract_subtitle(mkv, eng_pick["index"], eng_out, eng_codec)
@@ -1653,7 +1653,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 if not por_skipped:
                     por_codec = por_pick.get("codec", "srt")
                     por_ext = ".ass" if por_codec in ("ass", "ssa") else ".srt"
-                    por_out = mkv.parent / f"{stem}.{bot_code}{por_ext}"
+                    por_out = mkv.parent / f"{stem}.{bot_code}_extracted{por_ext}"
                     self.status_var.set(f"Extracting {bot_lang} from {mkv.name}...")
                     self.update_idletasks()
                     por_out = extract_subtitle(mkv, por_pick["index"], por_out, por_codec)
@@ -2285,17 +2285,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             except Exception as e:
                 errors.append(f"{tf}: {e}")
 
-        output_paths: set[Path] = set()
-        for tf, bf, _ in self.pairs:
-            tp = self.top_file_paths.get(tf)
-            if tp:
-                output_paths.add((tp.parent / output_name(tf)).resolve())
-
         cleaned = 0
         if self.cleanup_var.get() and converted > 0:
             for f in self._intermediate_files:
                 try:
-                    if f.is_file() and f.resolve() not in output_paths:
+                    if f.is_file():
                         f.unlink()
                         cleaned += 1
                 except OSError:
