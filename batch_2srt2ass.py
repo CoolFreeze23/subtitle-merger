@@ -729,8 +729,8 @@ def build_ass_merged(
         font_info = _extract_primary_dialogue_font(eng_style_lines)
 
     play_res_y = _get_play_res_y(script_info)
-    max_eng_bot_mv = _get_max_bottom_dialogue_margin(eng_style_lines)
-    por_bot_mv = play_res_y - max_eng_bot_mv + POR_BOT_GAP
+    min_eng_bot_mv = _get_min_bottom_dialogue_margin(eng_style_lines)
+    por_bot_mv = play_res_y - min_eng_bot_mv + POR_BOT_GAP
 
     max_eng_top_bottom = _get_max_top_dialogue_bottom(eng_style_lines)
     por_top_mv = max_eng_top_bottom + POR_BOT_GAP if max_eng_top_bottom > 0 else None
@@ -810,8 +810,14 @@ def _get_play_res_y(script_info: list[str]) -> int:
     return 360
 
 
-def _get_max_bottom_dialogue_margin(style_lines: list[str]) -> int:
-    max_mv = 0
+def _get_min_bottom_dialogue_margin(style_lines: list[str]) -> int:
+    """Find the smallest MarginV among bottom-aligned dialogue styles.
+
+    This represents the lowest English text on screen (closest to the
+    bottom edge), which determines where Portuguese text must start to
+    avoid overlap.
+    """
+    min_mv = 999999
     for line in style_lines:
         if not line.startswith("Style:"):
             continue
@@ -821,10 +827,11 @@ def _get_max_bottom_dialogue_margin(style_lines: list[str]) -> int:
             alignment = parts[18].strip()
             if alignment in ASS_BOTTOM_ALIGNMENTS and _is_dialogue_style(name):
                 try:
-                    max_mv = max(max_mv, int(parts[21].strip()))
+                    mv = int(parts[21].strip())
+                    min_mv = min(min_mv, mv)
                 except ValueError:
                     pass
-    return max_mv
+    return min_mv if min_mv != 999999 else 0
 
 
 def _get_max_top_dialogue_bottom(style_lines: list[str]) -> int:
